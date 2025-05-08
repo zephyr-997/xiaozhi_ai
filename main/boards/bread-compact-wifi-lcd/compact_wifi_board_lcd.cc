@@ -154,6 +154,7 @@ private:
         thing_manager.AddThing(iot::CreateThing("Screen"));
         thing_manager.AddThing(iot::CreateThing("Lamp"));
         thing_manager.AddThing(iot::CreateThing("Mydevice"));
+        thing_manager.AddThing(iot::CreateThing("ESPController"));
     }
 
 public:
