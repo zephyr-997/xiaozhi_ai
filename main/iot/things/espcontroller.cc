@@ -5,7 +5,7 @@
 #include "esp_event.h"       // ESP32事件循环
 #include "esp_netif.h"       // ESP32网络接口
 #include <esp_mqtt.h>        // ESP32 MQTT客户端
-// #include "D:\Study\ESP32CODE\xiaozhi-esp32\managed_components\78__esp-ml307\include\esp_mqtt.h"
+#include "assets/lang_config.h" //语音
 #include "driver/uart.h"     // UART驱动，用于串口通信
 #include <cstring>           // C字符串操作
 #include <vector>            // 标准模板库向量容器

@@ -2,12 +2,16 @@
 #include "esp_log.h"
 #include "board.h"
 #include "application.h"
+#include "assets/lang_config.h"
 #include <mqtt_client.h>
 #include <cstring>
 #include <vector>
+#include <queue>
 #include "esp_wifi.h"        // ESP32 WiFi功能
 #include "esp_event.h"       // ESP32事件循环
 #include "esp_netif.h"       // ESP32网络接口
+#include <functional>        // 用于函数对象
+#include <chrono>
 
 #define TAG "TtsSpeaker"
 
@@ -20,6 +24,9 @@
 // 订阅的TTS消息主题
 #define TTS_MESSAGE_TOPIC "xiaozhi/tts/message"
 
+// 定义检查播放队列的时间间隔（毫秒）
+#define TTS_CHECK_QUEUE_INTERVAL_MS 1000
+
 namespace iot {
 
 class TtsSpeaker : public Thing {
@@ -27,6 +34,15 @@ private:
     esp_mqtt_client_handle_t mqtt_client = nullptr;
     bool is_mqtt_connected = false;
     std::string last_message = "";
+    
+    // 添加TTS消息队列，用于存储待播放的消息
+    std::queue<std::string> tts_message_queue;
+    
+    // 定时器句柄，用于定期检查设备状态和播放队列
+    esp_timer_handle_t queue_check_timer = nullptr;
+    
+    // 队列检查互斥锁，防止同时访问队列
+    std::mutex queue_mutex;
     
     // WiFi事件处理函数 - 处理WiFi连接事件
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -127,6 +143,48 @@ private:
         }
     }
     
+    // 定时检查队列，自动播放待播放消息
+    static void check_queue_timer_callback(void* arg) {
+        TtsSpeaker* speaker = static_cast<TtsSpeaker*>(arg);
+        speaker->ProcessTtsQueue();
+    }
+    
+    // 处理TTS消息队列
+    void ProcessTtsQueue() {
+        auto& app = Application::GetInstance();
+        
+        // 检查设备是否空闲
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            
+            if (!tts_message_queue.empty()) {
+                std::string message = tts_message_queue.front();
+                tts_message_queue.pop();
+                
+                ESP_LOGI(TAG, "从队列播放消息: %s (剩余 %d 条消息)", 
+                        message.c_str(), tts_message_queue.size());
+                
+                // 测试不同的声音文件来确定哪个能正常工作
+                if (message.find("测试1") != std::string::npos) {
+                    ESP_LOGI(TAG, "使用振动音效播放队列消息");
+                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_VIBRATION);
+                } else if (message.find("测试2") != std::string::npos) {
+                    ESP_LOGI(TAG, "使用成功音效播放队列消息");
+                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_SUCCESS);
+                } else if (message.find("测试3") != std::string::npos) {
+                    ESP_LOGI(TAG, "使用激活音效播放队列消息");
+                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_ACTIVATION);
+                } else if (message.find("测试4") != std::string::npos) {
+                    ESP_LOGI(TAG, "使用感叹音效播放队列消息");
+                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+                } else {
+                    ESP_LOGI(TAG, "使用感叹音效播放队列消息(默认)");
+                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+                }
+            }
+        }
+    }
+    
     // 播放TTS消息
     void PlayTtsMessage(const std::string& message) {
         // 使用Application的云端TTS功能
@@ -136,10 +194,31 @@ private:
         if (app.GetDeviceState() == kDeviceStateIdle) {
             ESP_LOGI(TAG, "Playing TTS message: %s", message.c_str());
             
-            // 使用Alert函数显示消息并播放语音
-            app.Alert("TTS消息", message.c_str(), "happy");
+            // 测试不同的声音文件来确定哪个能正常工作
+            if (message.find("测试1") != std::string::npos) {
+                ESP_LOGI(TAG, "使用振动音效播放直接消息");
+                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_VIBRATION);
+            } else if (message.find("测试2") != std::string::npos) {
+                ESP_LOGI(TAG, "使用成功音效播放直接消息");
+                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_SUCCESS);
+            } else if (message.find("测试3") != std::string::npos) {
+                ESP_LOGI(TAG, "使用激活音效播放直接消息");
+                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_ACTIVATION);
+            } else if (message.find("测试4") != std::string::npos) {
+                ESP_LOGI(TAG, "使用感叹音效播放直接消息");
+                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+            } else {
+                ESP_LOGI(TAG, "使用感叹音效播放直接消息(默认)");
+                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+            }
         } else {
-            ESP_LOGW(TAG, "Device is busy, cannot play TTS message. Current state: %d", app.GetDeviceState());
+            ESP_LOGW(TAG, "设备忙，将消息加入队列。当前状态: %d", app.GetDeviceState());
+            
+            // 将消息添加到队列中
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            tts_message_queue.push(message);
+            
+            ESP_LOGI(TAG, "消息已加入队列，当前队列长度: %d", tts_message_queue.size());
         }
     }
     
@@ -184,6 +263,17 @@ public:
         // 启动MQTT客户端 - 假设WiFi已连接
         esp_mqtt_client_start(mqtt_client);
         
+        // 创建定时器，定期检查TTS消息队列
+        esp_timer_create_args_t timer_args = {
+            .callback = check_queue_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "tts_queue_check",
+            .skip_unhandled_events = false,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &queue_check_timer));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(queue_check_timer, TTS_CHECK_QUEUE_INTERVAL_MS * 1000));
+        
         // 注册属性
         properties_.AddBooleanProperty("mqtt_connected", "MQTT连接状态", [this]() -> bool {
             return is_mqtt_connected;
@@ -191,6 +281,11 @@ public:
         
         properties_.AddStringProperty("last_message", "最后收到的消息", [this]() -> std::string {
             return last_message;
+        });
+        
+        properties_.AddNumberProperty("queue_size", "消息队列长度", [this]() -> int {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            return tts_message_queue.size();
         });
         
         // 注册方法 - 手动播报文本
@@ -246,10 +341,28 @@ public:
                 return true;
             }
         );
+        
+        // 注册清空队列方法
+        methods_.AddMethod("clear_queue", "清空消息队列", 
+            ParameterList(),
+            [this](const ParameterList& params) {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                std::queue<std::string> empty;
+                std::swap(tts_message_queue, empty);
+                ESP_LOGI(TAG, "消息队列已清空");
+                return true;
+            }
+        );
     }
     
     // 析构函数
     ~TtsSpeaker() {
+        if (queue_check_timer != nullptr) {
+            esp_timer_stop(queue_check_timer);
+            esp_timer_delete(queue_check_timer);
+            queue_check_timer = nullptr;
+        }
+        
         if (mqtt_client != nullptr) {
             esp_mqtt_client_stop(mqtt_client);
             esp_mqtt_client_destroy(mqtt_client);
