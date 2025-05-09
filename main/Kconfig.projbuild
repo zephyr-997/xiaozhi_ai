@@ -185,7 +185,7 @@ endchoice
 choice DISPLAY_LCD_TYPE
     depends on BOARD_TYPE_BREAD_COMPACT_WIFI_LCD || BOARD_TYPE_BREAD_COMPACT_ESP32_LCD || BOARD_TYPE_ESP32_CGC
     prompt "LCD Type"
-    default LCD_ST7735_128X128
+    default LCD_ST7735_128X160
     help
         屏幕类型选择
     config LCD_ST7789_240X320

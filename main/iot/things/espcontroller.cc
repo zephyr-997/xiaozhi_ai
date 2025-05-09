@@ -119,7 +119,7 @@ private:
  
     public:
     // 构造函数 - 初始化控制器及其功能
-    ESPController() : Thing("LivingRoomController", "客厅设备控制器") {
+    ESPController() : Thing("ClockController", "时钟控制器") {
     // 确保网络接口只初始化一次
     static bool netif_initialized = false;
     if (!netif_initialized) {
@@ -156,13 +156,13 @@ private:
         // 创建UART读取任务
         xTaskCreate(uart_read_task, "uart_task", 4096, NULL, 2, NULL);
  
-        // 注册设备属性 - 客厅灯状态属性
-        properties_.AddBooleanProperty("light_status", "客厅灯状态", [this]() -> bool {
+        // 注册设备属性 - 时钟状态属性
+        properties_.AddBooleanProperty("clock_status", "时钟状态", [this]() -> bool {
             return false; // 此处简单返回false，实际应当反映真实状态
         });
  
-        // 注册控制方法 - 控制客厅灯开关
-        methods_.AddMethod("ControlLight", "控制客厅灯开关",
+        // 注册控制方法 - 控制时钟开关
+        methods_.AddMethod("ControlClock", "控制时钟开关",
             ParameterList(std::vector<Parameter>{Parameter("state", "开关状态", kValueTypeString)}),
             [this](const ParameterList& params) {
                 // 发送MQTT命令控制灯光
