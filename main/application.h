@@ -73,6 +73,8 @@ public:
     void WakeWordInvoke(const std::string& wake_word);
     void PlaySound(const std::string_view& sound);
     bool CanEnterSleepMode();
+    Protocol* GetProtocol() const;
+    void SetListeningMode(ListeningMode mode);
 
 private:
     Application();
@@ -126,7 +128,6 @@ private:
     void CheckNewVersion();
     void ShowActivationCode();
     void OnClockTimer();
-    void SetListeningMode(ListeningMode mode);
     void AudioLoop();
 };
 

@@ -7,6 +7,7 @@
 
 #include "application.h"
 #include "system_info.h"
+#include "settings.h"  //禁用OTA功能
 
 #define TAG "main"
 
@@ -23,6 +24,11 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // 设置禁用OTA功能
+    Settings settings("system", true);
+    settings.SetInt("disable_ota", 1);
+    ESP_LOGI(TAG, "已禁用OTA功能");
 
     // Launch the application
     Application::GetInstance().Start();

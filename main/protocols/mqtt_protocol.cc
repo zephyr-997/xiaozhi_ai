@@ -101,7 +101,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 }
 
 bool MqttProtocol::SendText(const std::string& text) {
+    ESP_LOGI(TAG, "MqttProtocol::SendText sending: %s", text.c_str());
     if (publish_topic_.empty()) {
+        ESP_LOGE(TAG, "MqttProtocol::SendText error: publish_topic_ is empty");
         return false;
     }
     if (!mqtt_->Publish(publish_topic_, text)) {
@@ -109,6 +111,7 @@ bool MqttProtocol::SendText(const std::string& text) {
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }
+    ESP_LOGI(TAG, "MqttProtocol::SendText published successfully to topic: %s", publish_topic_.c_str());
     return true;
 }
 

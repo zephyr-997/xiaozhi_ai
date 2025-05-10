@@ -9,6 +9,7 @@
 #include "font_awesome_symbols.h"
 #include "iot/thing_manager.h"
 #include "assets/lang_config.h"
+#include "settings.h" // 禁用OTA功能
 
 #include <cstring>
 #include <esp_log.h>
@@ -17,6 +18,9 @@
 #include <arpa/inet.h>
 
 #define TAG "Application"
+
+
+
 
 
 static const char* const STATE_STRINGS[] = {
@@ -62,7 +66,20 @@ Application::~Application() {
     vEventGroupDelete(event_group_);
 }
 
+// Added to get the protocol instance
+Protocol* Application::GetProtocol() const {
+    return protocol_.get();
+}
+
 void Application::CheckNewVersion() {
+    // 检查是否禁用OTA功能
+    Settings settings("system");
+    if (settings.GetInt("disable_ota", 0) == 1) {
+        ESP_LOGI(TAG, "OTA功能已禁用");
+        xEventGroupSetBits(event_group_, CHECK_NEW_VERSION_DONE_EVENT);
+        return;
+    }
+
     const int MAX_RETRY = 10;
     int retry_count = 0;
     int retry_delay = 10; // 初始重试延迟为10秒

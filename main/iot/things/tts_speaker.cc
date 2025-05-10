@@ -3,6 +3,7 @@
 #include "board.h"
 #include "application.h"
 #include "assets/lang_config.h"
+#include "display/display.h"
 #include <mqtt_client.h>
 #include <cstring>
 #include <vector>
@@ -25,7 +26,7 @@
 #define TTS_MESSAGE_TOPIC "xiaozhi/tts/message"
 
 // 定义检查播放队列的时间间隔（毫秒）
-#define TTS_CHECK_QUEUE_INTERVAL_MS 1000
+#define TTS_CHECK_QUEUE_INTERVAL_MS 500  // 减少检查间隔，提高响应速度
 
 namespace iot {
 
@@ -43,6 +44,127 @@ private:
     
     // 队列检查互斥锁，防止同时访问队列
     std::mutex queue_mutex;
+    
+    // 标记当前是否正在处理队列消息
+    bool is_processing_queue = false;
+    
+    // 发送文本到服务器进行TTS转换
+    void SendTts(const std::string& text) {
+        auto& app = Application::GetInstance();
+        DeviceState original_state = app.GetDeviceState();
+
+        if (original_state == kDeviceStateIdle) {
+            ESP_LOGI(TAG, "开始TTS处理（模拟唤醒流程）：%s", text.c_str());
+
+            // 1. 设置状态为Connecting，这将允许后续的OpenAudioChannel调用
+            // 注意：不直接调用 app.ToggleChatState()，因为它会立即发送 listen:start
+            // 我们需要先发送 listen:detect(text)
+            app.SetDeviceState(kDeviceStateConnecting);
+
+            auto proto = app.GetProtocol();
+            if (!proto) {
+                ESP_LOGE(TAG, "无法获取Protocol实例");
+                app.SetDeviceState(kDeviceStateIdle); // 恢复状态
+                return;
+            }
+
+            // 2. 打开音频通道获取 session_id
+            ESP_LOGI(TAG, "尝试打开音频通道...");
+            if (!proto->OpenAudioChannel()) {
+                ESP_LOGE(TAG, "打开音频通道失败");
+                app.SetDeviceState(kDeviceStateIdle); // 恢复状态
+                // 注意：OpenAudioChannel 内部可能会调用 SetError，并通过回调设置 App 为 Idle
+                return;
+            }
+            ESP_LOGI(TAG, "音频通道已打开，Session ID: %s", proto->session_id().c_str());
+
+            // 3. 发送模拟的唤醒词检测消息，其中 text 是我们要播报的内容
+            ESP_LOGI(TAG, "发送模拟唤醒词检测 (listen:detect) JSON: %s", text.c_str());
+            proto->SendWakeWordDetected(text); // SendWakeWordDetected 内部会构造JSON并调用 SendText
+
+            // 4. 设置聆听模式，这将使 Application 进入 kDeviceStateListening 并发送 listen:start
+            // 我们使用 kListeningModeAutoStop 作为默认模式
+            ESP_LOGI(TAG, "设置聆听模式为 AutoStop");
+            app.SetListeningMode(kListeningModeAutoStop); 
+                                                        
+            // 5. 循环等待设备进入 speaking 状态, 然后等待其结束 (回到 idle 或 listening)
+            ESP_LOGI(TAG, "等待服务器TTS响应并进入Speaking状态...");
+            bool speaking_detected = false;
+            int timeout_ms_speaking = 30 * 1000 / 10; // 30秒超时，每次检查间隔10ms (与之前循环次数匹配)
+            
+            for (int i = 0; i < (30 * 1000 / 10); i++) { // 等待最多30秒 (500ms * 60 = 30s)
+                vTaskDelay(pdMS_TO_TICKS(10)); // 减少延迟，提高状态捕获精度
+                DeviceState current_app_state = app.GetDeviceState();
+
+                if (!speaking_detected && current_app_state == kDeviceStateSpeaking) {
+                    speaking_detected = true;
+                    ESP_LOGI(TAG, "检测到设备开始播放TTS (进入Speaking状态)");
+                    // 进入Speaking状态后，重置超时计数器或使用新的计数器等待播放结束
+                    // 这里我们继续使用同一个循环，但逻辑上是进入了第二阶段的等待
+                }
+
+                if (speaking_detected) {
+                    if (current_app_state == kDeviceStateIdle) {
+                        ESP_LOGI(TAG, "TTS播放完成 (Speaking后回到Idle)");
+                        // 正常结束，音频通道应由服务器或Application的OnIncomingJson中的tts:stop逻辑关闭
+                        // 或者由Application的Idle状态转换逻辑关闭
+                        return; 
+                    }
+                    if (current_app_state == kDeviceStateListening) {
+                        ESP_LOGI(TAG, "TTS播放后进入Listening状态 (可能已完成或被唤醒打断)");
+                        // 此时也认为我们的TTS任务完成了主要部分
+                        return; 
+                    }
+                }
+                
+                if (i >= (timeout_ms_speaking -1) ) { // timeout_ms_speaking是次数
+                     if (!speaking_detected) {
+                        ESP_LOGW(TAG, "TTS处理超时 (等待Speaking状态超时). 当前状态: %d", current_app_state);
+                     } else {
+                        ESP_LOGW(TAG, "TTS处理超时 (等待Speaking结束后回到Idle/Listening超时). 当前状态: %d", current_app_state);
+                     }
+                    break; 
+                }
+            }
+            
+            // 6. 超时或未能正常完成后的处理
+            if (!speaking_detected) {
+                ESP_LOGW(TAG, "未检测到TTS播放活动，可能服务器未响应或JSON格式/流程错误");
+            } else {
+                ESP_LOGW(TAG, "检测到Speaking但未在超时内回到Idle/Listening状态");
+            }
+
+            // 清理：确保音频通道关闭，并返回Idle状态
+            // 只有当我们明确知道流程是我们发起并且可能未被正常关闭时才主动关闭
+            // 如果speaking_detected为true，可能Application的正常逻辑会处理关闭
+            // 但如果超时了，我们最好主动清理
+            ESP_LOGI(TAG, "TTS流程结束/超时，确保返回Idle并关闭音频通道");
+            if (proto->IsAudioChannelOpened()) {
+                 ESP_LOGI(TAG, "通道仍打开，发送goodbye并关闭");
+                 // app.ToggleChatState(); // 这在非Idle时会调用CloseAudioChannel，发送goodbye
+                 // 我们直接调用CloseAudioChannel更明确
+                 proto->CloseAudioChannel(); // 这会发送 goodbye
+            }
+            // 确保最终回到Idle
+            if(app.GetDeviceState() != kDeviceStateIdle){
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+
+        } else {
+            // 非空闲状态，加入队列 (与之前逻辑相同)
+            ESP_LOGW(TAG, "设备不处于空闲状态（%d），无法立即播放TTS消息", original_state);
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            // ... (将消息重新添加到队列前端的代码) ...
+            // 修正：将消息重新添加到队列前端，等待设备恢复空闲状态
+            std::queue<std::string> temp_queue;
+            temp_queue.push(text); // 新消息放最前
+            while (!tts_message_queue.empty()) {
+                temp_queue.push(tts_message_queue.front());
+                tts_message_queue.pop();
+            }
+            tts_message_queue.swap(temp_queue);
+        }
+    }
     
     // WiFi事件处理函数 - 处理WiFi连接事件
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -151,74 +273,113 @@ private:
     
     // 处理TTS消息队列
     void ProcessTtsQueue() {
-        auto& app = Application::GetInstance();
+        // 如果正在处理队列，则跳过此次调用
+        if (is_processing_queue) {
+            return;
+        }
         
-        // 检查设备是否空闲
-        if (app.GetDeviceState() == kDeviceStateIdle) {
-            std::lock_guard<std::mutex> lock(queue_mutex);
+        auto& app = Application::GetInstance();
+        DeviceState state = app.GetDeviceState();
+        
+        // 检查设备是否空闲或已完成对话但未回到空闲状态
+        if (state == kDeviceStateIdle || 
+            (state != kDeviceStateConnecting && 
+             state != kDeviceStateListening && 
+             state != kDeviceStateSpeaking)) {
+            
+            std::unique_lock<std::mutex> lock(queue_mutex);
             
             if (!tts_message_queue.empty()) {
+                is_processing_queue = true;
                 std::string message = tts_message_queue.front();
                 tts_message_queue.pop();
                 
-                ESP_LOGI(TAG, "从队列播放消息: %s (剩余 %d 条消息)", 
-                        message.c_str(), tts_message_queue.size());
+                int queue_size = tts_message_queue.size();
                 
-                // 测试不同的声音文件来确定哪个能正常工作
-                if (message.find("测试1") != std::string::npos) {
-                    ESP_LOGI(TAG, "使用振动音效播放队列消息");
-                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_VIBRATION);
-                } else if (message.find("测试2") != std::string::npos) {
-                    ESP_LOGI(TAG, "使用成功音效播放队列消息");
-                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_SUCCESS);
-                } else if (message.find("测试3") != std::string::npos) {
-                    ESP_LOGI(TAG, "使用激活音效播放队列消息");
-                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_ACTIVATION);
-                } else if (message.find("测试4") != std::string::npos) {
-                    ESP_LOGI(TAG, "使用感叹音效播放队列消息");
-                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
-                } else {
-                    ESP_LOGI(TAG, "使用感叹音效播放队列消息(默认)");
-                    app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+                ESP_LOGI(TAG, "从队列播放消息: %s (剩余 %d 条消息)", 
+                        message.c_str(), queue_size);
+                
+                // 释放锁后处理消息
+                lock.unlock();
+                
+                // 如果设备状态不是idle，先确保回到idle状态
+                if (state != kDeviceStateIdle) {
+                    ESP_LOGI(TAG, "设备状态为 %d，尝试切换到空闲状态", state);
+                    
+                    // 延迟一小段时间，确保设备稳定
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    
+                    // 如果仍未回到空闲状态，强制设置为空闲
+                    if (app.GetDeviceState() != kDeviceStateIdle) {
+                        app.SetDeviceState(kDeviceStateIdle);
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                    }
                 }
+                
+                // 发送文本到TTS服务器
+                SendTts(message);
+                
+                // 处理完成
+                is_processing_queue = false;
             }
         }
     }
     
     // 播放TTS消息
     void PlayTtsMessage(const std::string& message) {
-        // 使用Application的云端TTS功能
+        // 获取设备实例
         auto& app = Application::GetInstance();
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
         
-        // 检查设备状态，只有在空闲状态才播放TTS
-        if (app.GetDeviceState() == kDeviceStateIdle) {
-            ESP_LOGI(TAG, "Playing TTS message: %s", message.c_str());
+        // 获取当前设备状态
+        DeviceState state = app.GetDeviceState();
+        const char* state_names[] = {
+            "未知", "启动中", "配置中", "空闲", "连接中", "听取中", 
+            "说话中", "升级中", "激活中", "致命错误"
+        };
+        
+        ESP_LOGI(TAG, "收到MQTT TTS消息: %s (当前设备状态: %s)", 
+                 message.c_str(), state_names[state]);
+        
+        // 消息处理策略：
+        // 1. 空闲状态且没有其他处理：立即播放
+        // 2. 其他状态：排队等待空闲
+        if (state == kDeviceStateIdle && !is_processing_queue) {
+            // 立即播放消息
+            ESP_LOGI(TAG, "设备空闲，立即播放TTS消息: %s", message.c_str());
             
-            // 测试不同的声音文件来确定哪个能正常工作
-            if (message.find("测试1") != std::string::npos) {
-                ESP_LOGI(TAG, "使用振动音效播放直接消息");
-                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_VIBRATION);
-            } else if (message.find("测试2") != std::string::npos) {
-                ESP_LOGI(TAG, "使用成功音效播放直接消息");
-                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_SUCCESS);
-            } else if (message.find("测试3") != std::string::npos) {
-                ESP_LOGI(TAG, "使用激活音效播放直接消息");
-                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_ACTIVATION);
-            } else if (message.find("测试4") != std::string::npos) {
-                ESP_LOGI(TAG, "使用感叹音效播放直接消息");
-                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
-            } else {
-                ESP_LOGI(TAG, "使用感叹音效播放直接消息(默认)");
-                app.Alert("TTS消息", message.c_str(), "happy", Lang::Sounds::P3_EXCLAMATION);
+            // 设置正在处理标志
+            is_processing_queue = true;
+            
+            // 显示消息内容
+            if (display) {
+                display->SetChatMessage("tts", message.c_str());
             }
+            
+            // 发送文本到TTS服务器
+            SendTts(message);
+            
+            // 处理完成
+            is_processing_queue = false;
         } else {
-            ESP_LOGW(TAG, "设备忙，将消息加入队列。当前状态: %d", app.GetDeviceState());
+            // 设备忙或有其他处理进行中，将消息加入队列
+            ESP_LOGW(TAG, "设备忙 (%s)，将消息加入队列", state_names[state]);
             
             // 将消息添加到队列中
             std::lock_guard<std::mutex> lock(queue_mutex);
             tts_message_queue.push(message);
             
-            ESP_LOGI(TAG, "消息已加入队列，当前队列长度: %d", tts_message_queue.size());
+            // 记录队列长度
+            int queue_size = tts_message_queue.size();
+            ESP_LOGI(TAG, "消息已加入队列，当前队列长度: %d", queue_size);
+            
+            // 在屏幕上显示队列状态
+            if (display && queue_size > 1) {
+                char buffer[64];
+                snprintf(buffer, sizeof(buffer), "TTS队列: %d 条消息", queue_size);
+                display->ShowNotification(buffer, 2000);
+            }
         }
     }
     
@@ -226,6 +387,9 @@ public:
     // 构造函数
     TtsSpeaker() : Thing("TtsSpeaker", "TTS语音播报器") {
         ESP_LOGI(TAG, "初始化TTS Speaker");
+        
+        // 初始化标志
+        is_processing_queue = false;
         
         // 确保网络接口只初始化一次
         static bool netif_initialized = false;
