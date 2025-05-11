@@ -49,19 +49,41 @@ I (308441) Application: << ”
 
 方案
 
-1. 添加了一个新的SendTts方法，用于处理文本到语音的转换：
+回顾 xiaozhi-esp32 (来自您提供的GitHub链接 https://github.com/78/xiaozhi-esp32) 的常规TTS流程（基于其设计）： 
 
-- 首先在屏幕上显示收到的消息文本
+ 通常这类项目的TTS流程是： 
 
-- 触发语音对话状态（通过ToggleChatState）
+ 用户通过按键或语音唤醒词激活设备。 
 
-- 向服务器发送带有"请朗读以下内容"前缀的消息内容
+ 设备进入聆听状态 (kDeviceStateListening)。 
 
-- 等待足够的时间让服务器返回并播放语音
+ 用户说出语音指令。 
 
-- 完成后返回待机状态
+ Application 将捕获到的语音数据通过 Protocol 发送到云端进行ASR（语音识别）。 
 
-- 
+ ASR结果（文本）返回给 Application。 
+
+ Application 将ASR文本发送给LLM（大语言模型）。 
+
+ LLM返回响应文本。 
+
+ Application 将LLM的响应文本通过 Protocol 发送到云端进行TTS（文本转语音）。 
+
+ TTS服务返回音频流。 
+
+ Application 播放音频流，此时设备状态变为 kDeviceStateSpeaking。 
+
+ 播放完毕，设备返回 kDeviceStateIdle。 
+
+ 我们的 TtsSpeaker 尝试做的事情： 
+
+ 我们试图通过 SendTts 函数直接注入文本到这个流程的第8步（或类似的地方），期望 Application 能直接将我们的文本发送给TTS服务器。 
+
+ 当前的问题根源很可能在于： 
+
+ Application 类并没有提供一个直接的API来接收一个外部文本字符串并启动TTS流程。它主要依赖于语音输入和内部状态机来驱动整个对话和TTS过程。我们通过 display->SetChatMessage() 和 app.ToggleChatState() 的组合拳，未能成功“欺骗”或“触发” Application 按照我们的意图执行TTS。 
+
+
 
 目的：
 1.在小智与主人对话的过程中，如果接受到mqt消息则按顺序储存，等小智回到待机时自动播报文本内容。
@@ -73,3 +95,9 @@ I (308441) Application: << ”
 
 
 先检查能不能上传服务器、能不能接受到服务器的反馈，再检查能不能正常播报
+
+
+
+问题一：开机后接收到mqtt消息后，能够进行语音播报，但是会触发ASR语音识别功能，请帮我设置在使用
+
+问题二：出现以上警告或者错误导致编译失败，请分析和解决问题
