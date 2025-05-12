@@ -48,6 +48,12 @@ private:
     // 标记当前是否正在处理队列消息
     bool is_processing_queue = false;
     
+    // 是否使用直接TTS模式（不触发ASR)
+    bool use_direct_tts_mode_ = true;
+    
+    // 保存TTS前麦克风状态，供计时器回调使用
+    bool input_enabled_before_tts_ = true;
+    
     // 发送文本到服务器进行TTS转换
     void SendTts(const std::string& text) {
         auto& app = Application::GetInstance();
@@ -316,12 +322,203 @@ private:
                     }
                 }
                 
-                // 发送文本到TTS服务器
-                SendTts(message);
+                // 根据模式选择TTS方式
+                if (use_direct_tts_mode_) {
+                    // 使用直接TTS方式发送
+                    DirectTTS(message);
+                } else {
+                    // 使用原有方式（触发ASR）
+                    SendTts(message);
+                }
                 
                 // 处理完成
                 is_processing_queue = false;
             }
+        }
+    }
+    
+    // 直接发送文本到TTS服务器，不触发ASR
+    void DirectTTS(const std::string& text) {
+        auto& app = Application::GetInstance();
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+        auto codec = board.GetAudioCodec();
+        DeviceState original_state = app.GetDeviceState();
+
+        if (original_state == kDeviceStateIdle) {
+            ESP_LOGI(TAG, "开始直接TTS处理：%s", text.c_str());
+            
+            // 显示消息内容
+            if (display) {
+                display->SetChatMessage("tts", text.c_str());
+            }
+
+            // 设置状态为Connecting
+            app.SetDeviceState(kDeviceStateConnecting);
+
+            auto proto = app.GetProtocol();
+            if (!proto) {
+                ESP_LOGE(TAG, "无法获取Protocol实例");
+                app.SetDeviceState(kDeviceStateIdle);
+                return;
+            }
+
+            // 保存当前麦克风状态
+            bool was_input_enabled = true;
+            if (codec) {
+                was_input_enabled = codec->input_enabled();  // 修正方法名
+                ESP_LOGI(TAG, "暂时禁用麦克风输入");
+                codec->EnableInput(false);
+            }
+
+            // 打开音频通道
+            ESP_LOGI(TAG, "尝试打开音频通道...");
+            if (!proto->OpenAudioChannel()) {
+                ESP_LOGE(TAG, "打开音频通道失败");
+                app.SetDeviceState(kDeviceStateIdle);
+                // 恢复麦克风状态
+                if (codec && was_input_enabled) {
+                    ESP_LOGI(TAG, "恢复麦克风输入");
+                    codec->EnableInput(true);
+                }
+                return;
+            }
+
+            // 设置为自动停止模式，但实际通过我们自己的计时器控制
+            app.SetListeningMode(kListeningModeManualStop);  // 改为手动模式，防止自动进入listening
+
+            // 保存会话ID，以便后续处理
+            std::string session_id = proto->session_id();  // 修正方法名
+            ESP_LOGI(TAG, "音频通道已打开，Session ID: %s", session_id.c_str());
+
+            // 发送带TTS标记的消息
+            std::string tts_message = "[TTS]" + text;
+            ESP_LOGI(TAG, "发送带TTS标记的消息: {\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"%s\"}", 
+                    session_id.c_str(), tts_message.c_str());
+            
+            proto->SendText("{\"session_id\":\"" + session_id + 
+                           "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + 
+                           tts_message + "\"}");
+
+            // 等待服务器响应
+            app.SetDeviceState(kDeviceStateListening);
+            ESP_LOGI(TAG, "等待服务器TTS响应并进入Speaking状态...");
+            
+            // 使用两个计时器实现更可靠的TTS控制
+            
+            // 1. 短计时器用于监听结束后立即中断，防止进入listening状态
+            const esp_timer_create_args_t short_timer_args = {
+                .callback = [](void* arg) {
+                    auto& app = Application::GetInstance();
+                    auto proto = app.GetProtocol();
+                    DeviceState current_state = app.GetDeviceState();
+                    
+                    // 只有当当前状态是speaking时才检查，避免过早abort
+                    if (current_state == kDeviceStateSpeaking) {
+                        ESP_LOGI("TtsSpeaker", "检测TTS状态：当前为Speaking");
+                        // 启动短间隔循环检查TTS是否结束
+                        auto timer_handle = static_cast<esp_timer_handle_t>(arg);
+                        // 继续定时检查
+                        esp_timer_start_once(timer_handle, 500 * 1000); // 每0.5秒检查一次
+                    } 
+                    // 如果状态变为listening，说明TTS播放已结束，立即中断
+                    else if (current_state == kDeviceStateListening) {
+                        ESP_LOGI("TtsSpeaker", "检测到TTS播放结束，主动中断会话");
+                        if (proto) {
+                            proto->SendText("{\"session_id\":\"" + proto->session_id() + "\",\"type\":\"abort\"}");
+                            ESP_LOGI("TtsSpeaker", "已发送abort消息");
+                        }
+                    }
+                },
+                .arg = nullptr,  // 将在创建后设置为timer_handle本身
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "tts_monitor"
+            };
+            
+            // 2. 长计时器作为最终保障确保恢复idle状态
+            const esp_timer_create_args_t long_timer_args = {
+                .callback = [](void* arg) {
+                    auto& app = Application::GetInstance();
+                    auto proto = app.GetProtocol();
+                    auto codec = Board::GetInstance().GetAudioCodec();
+                    auto tts_speaker = static_cast<TtsSpeaker*>(arg);
+                    
+                    ESP_LOGI("TtsSpeaker", "TTS播放计时结束，主动关闭会话并恢复idle状态");
+                    
+                    // 发送abort消息，终止当前会话
+                    if (proto) {
+                        proto->SendText("{\"session_id\":\"" + proto->session_id() + "\",\"type\":\"abort\"}");
+                    }
+                    
+                    // 等待一小段时间让abort消息发出
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    
+                    // 强制回到待机状态
+                    if (app.GetDeviceState() != kDeviceStateIdle) {
+                        ESP_LOGI("TtsSpeaker", "强制回到待机状态");
+                        app.SetDeviceState(kDeviceStateIdle);
+                    }
+                    
+                    // 恢复麦克风状态
+                    if (codec && tts_speaker->input_enabled_before_tts_) {
+                        ESP_LOGI("TtsSpeaker", "恢复麦克风输入状态");
+                        codec->EnableInput(true);
+                    }
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "tts_timeout"
+            };
+            
+            // 存储麦克风状态供计时器回调使用
+            input_enabled_before_tts_ = was_input_enabled;
+            
+            // 创建短计时器用于实时监控状态
+            esp_timer_handle_t short_timer_handle;
+            esp_timer_create(&short_timer_args, &short_timer_handle);
+            // ESP-IDF可能不支持esp_timer_set_arg，改为创建一个静态变量保存timer_handle
+            static esp_timer_handle_t monitor_timer;
+            monitor_timer = short_timer_handle;
+            const esp_timer_create_args_t short_timer_args_fixed = {
+                .callback = [](void* arg) {
+                    auto& app = Application::GetInstance();
+                    auto proto = app.GetProtocol();
+                    DeviceState current_state = app.GetDeviceState();
+                    
+                    // 只有当当前状态是speaking时才检查，避免过早abort
+                    if (current_state == kDeviceStateSpeaking) {
+                        ESP_LOGI("TtsSpeaker", "检测TTS状态：当前为Speaking");
+                        // 继续定时检查
+                        esp_timer_start_once(monitor_timer, 500 * 1000); // 每0.5秒检查一次
+                    } 
+                    // 如果状态变为listening，说明TTS播放已结束，立即中断
+                    else if (current_state == kDeviceStateListening) {
+                        ESP_LOGI("TtsSpeaker", "检测到TTS播放结束，主动中断会话");
+                        if (proto) {
+                            proto->SendText("{\"session_id\":\"" + proto->session_id() + "\",\"type\":\"abort\"}");
+                            ESP_LOGI("TtsSpeaker", "已发送abort消息");
+                        }
+                    }
+                },
+                .arg = nullptr,  
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "tts_monitor"
+            };
+            esp_timer_create(&short_timer_args_fixed, &short_timer_handle);
+            // 启动短计时器，1秒后开始监控
+            esp_timer_start_once(short_timer_handle, 1000 * 1000);
+            
+            // 创建长计时器作为最终保障
+            esp_timer_handle_t long_timer_handle;
+            esp_timer_create(&long_timer_args, &long_timer_handle);
+            // 长计时器设置为较长时间（20秒）作为兜底保障
+            esp_timer_start_once(long_timer_handle, 20 * 1000 * 1000);
+        } else {
+            ESP_LOGI(TAG, "设备当前状态不是空闲，无法立即播放TTS消息");
+            // 将消息加入队列
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            tts_message_queue.push(text);
+            ESP_LOGI(TAG, "消息已加入队列，当前队列长度: %d", (int)tts_message_queue.size());
         }
     }
     
@@ -357,8 +554,14 @@ private:
                 display->SetChatMessage("tts", message.c_str());
             }
             
-            // 发送文本到TTS服务器
-            SendTts(message);
+            // 根据模式选择TTS方式
+            if (use_direct_tts_mode_) {
+                // 使用直接TTS方式发送
+                DirectTTS(message);
+            } else {
+                // 使用原有方式（触发ASR）
+                SendTts(message);
+            }
             
             // 处理完成
             is_processing_queue = false;
@@ -452,6 +655,24 @@ public:
             return tts_message_queue.size();
         });
         
+        // 注册控制TTS模式的方法
+        methods_.AddMethod("set_tts_mode", "设置TTS模式", 
+            ParameterList({
+                Parameter("direct_mode", "是否使用直接TTS模式(不触发ASR)", kValueTypeBoolean, true)
+            }),
+            [this](const ParameterList& params) {
+                bool direct_mode = params["direct_mode"].boolean();
+                use_direct_tts_mode_ = direct_mode;
+                ESP_LOGI(TAG, "TTS模式已设置为: %s", direct_mode ? "直接模式" : "ASR触发模式");
+                return true;
+            }
+        );
+        
+        // 注册获取当前TTS模式的属性
+        properties_.AddBooleanProperty("direct_tts_mode", "是否使用直接TTS模式", [this]() -> bool {
+            return use_direct_tts_mode_;
+        });
+        
         // 注册方法 - 手动播报文本
         methods_.AddMethod("speak", "播报文本", 
             ParameterList({
@@ -517,6 +738,9 @@ public:
                 return true;
             }
         );
+        
+        // 默认启用直接TTS模式
+        use_direct_tts_mode_ = true;
     }
     
     // 析构函数
