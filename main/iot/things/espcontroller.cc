@@ -7,6 +7,8 @@
 #include <esp_mqtt.h>        // ESP32 MQTT客户端
 #include "assets/lang_config.h" //语音
 #include "driver/uart.h"     // UART驱动，用于串口通信
+#include "application.h"     // 应用程序管理类
+#include "protocol.h"        // 协议处理
 #include <cstring>           // C字符串操作
 #include <vector>            // 标准模板库向量容器
  
@@ -20,6 +22,7 @@
  
 // MQTT 主题 - 用于控制不同设备的主题
 #define MQTT_COMMAND_TOPIC    "HA-CMD-01/01/state"  // 统一命令主题
+#define IDLE_MODE_TOPIC       "HA-CMD-01/02/state" // 待机模式控制主题
  
 // UART 配置 - 用于串口通信的设置
 #define UART_PORT UART_NUM_1 // 使用UART1端口
@@ -58,11 +61,68 @@ private:
     static void mqtt_event_handler(void* handler_args, esp_event_base_t base, 
                                   int32_t event_id, void* event_data) {
         esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-        if (event->event_id == MQTT_EVENT_CONNECTED) {
-            // MQTT连接成功的处理
-            ESP_LOGI(TAG, "MQTT Connected");
+        switch (event->event_id) {
+            case MQTT_EVENT_BEFORE_CONNECT:
+                ESP_LOGI(TAG, "MQTT准备连接...");
+                break;
+                
+            case MQTT_EVENT_CONNECTED:
+                // MQTT连接成功的处理
+                ESP_LOGI(TAG, "MQTT Connected");
+                
+                // 订阅待机控制主题
+                esp_mqtt_client_subscribe(mqtt_client, IDLE_MODE_TOPIC, 1);
+                ESP_LOGI(TAG, "已订阅待机控制主题: %s", IDLE_MODE_TOPIC);
+                break;
+                
+            case MQTT_EVENT_DATA:
+                // 收到任何MQTT消息消息都设置设备为idle状态
+                if (event->topic_len > 0 && event->data_len > 0) {
+                    // 复制主题和数据以便使用C++字符串处理
+                    std::string topic(event->topic, event->topic_len);
+                    std::string data(event->data, event->data_len);
+                    
+                    ESP_LOGI(TAG, "收到MQTT消息: 主题=%s, 数据=%s", 
+                             topic.c_str(), data.c_str());
+                    
+                    // 检查是否是待机控制主题
+                    if (topic == IDLE_MODE_TOPIC) {
+                        ESP_LOGI(TAG, "接收到待机控制命令，设备将进入idle模式");
+                        // 调用设置idle状态的函数
+                        set_device_idle(); 
+                    }
+                }
+                break;
+                
+            case MQTT_EVENT_DISCONNECTED:
+                ESP_LOGI(TAG, "MQTT已断开连接");
+                break;
+                
+            case MQTT_EVENT_ERROR:
+                ESP_LOGE(TAG, "MQTT错误");
+                break;
+                
+            case MQTT_EVENT_SUBSCRIBED:
+                ESP_LOGI(TAG, "MQTT订阅成功，msg_id=%d", event->msg_id);
+                break;
+                
+            case MQTT_EVENT_UNSUBSCRIBED:
+                ESP_LOGI(TAG, "MQTT取消订阅，msg_id=%d", event->msg_id);
+                break;
+                
+            case MQTT_EVENT_PUBLISHED:
+                ESP_LOGI(TAG, "MQTT消息发布成功，msg_id=%d", event->msg_id);
+                break;
+                
+            case MQTT_EVENT_DELETED:
+                ESP_LOGI(TAG, "MQTT消息已删除");
+                break;
+                
+            // 添加默认处理分支，处理其他可能的事件
+            default:
+                ESP_LOGI(TAG, "其他MQTT事件: %d", event->event_id);
+                break;
         }
-        // 可以添加其他MQTT事件处理，如断开连接、接收消息等
     }
  
     // UART读取任务 - 持续读取串口命令并执行相应操作
@@ -136,6 +196,29 @@ private:
         // 记录日志：已发送的指令及内容
         ESP_LOGI(TAG, "发送指令: %s -> %s", topic, payload);
     }
+    
+    // 设置设备为idle状态的函数
+    static void set_device_idle() {
+        ESP_LOGI(TAG, "尝试将设备设置为idle状态");
+        
+        // 获取Application实例
+        auto& app = Application::GetInstance();
+        
+        // 获取当前设备状态
+        DeviceState current_state = app.GetDeviceState();
+        ESP_LOGI(TAG, "当前设备状态: %d", current_state);
+        
+        // 如果有正在进行的会话，先关闭会话
+        auto proto = app.GetProtocol();
+        if (proto && proto->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "关闭当前音频通道");
+            proto->CloseAudioChannel();
+        }
+        
+        // 强制设置为idle状态
+        app.SetDeviceState(kDeviceStateIdle);
+        ESP_LOGI(TAG, "设备已设置为idle状态");
+    }
  
     public:
     // 构造函数 - 初始化控制器及其功能
@@ -181,7 +264,7 @@ private:
             return false; // 此处简单返回false，实际应当反映真实状态
         });
  
-        // 注册控制方法 - 控制休息模式
+        // 注册控制方法 - 控制休息模式 - 开始休息
         methods_.AddMethod("ControlRestMode", "控制休息模式",
             ParameterList(std::vector<Parameter>{Parameter("state", "状态(start/stop)", kValueTypeString)}),
             [this](const ParameterList& params) {
@@ -195,7 +278,7 @@ private:
             }
         );
 
-        // 注册控制方法 - 控制计时开关
+        // 注册控制方法 - 控制计时开关 - 开始计时
         methods_.AddMethod("ControlTimer", "控制计时开关",
             ParameterList(std::vector<Parameter>{Parameter("state", "状态(start/stop)", kValueTypeString)}),
             [this](const ParameterList& params) {
@@ -209,9 +292,9 @@ private:
             }
         );
 
-        // 注册控制方法 - 设置倒计时时间
+        // 注册控制方法 - 设置倒计时时间  - 设置倒计时20分钟
         methods_.AddMethod("SetCountdownTimer", "设置倒计时时间",
-            ParameterList(std::vector<Parameter>{Parameter("minutes", "倒计时分钟数", kValueTypeString)}),
+            ParameterList(std::vector<Parameter>{Parameter("minutes", "分钟数", kValueTypeString)}),
             [this](const ParameterList& params) {
                 // 发送MQTT命令设置倒计时时间
                 std::string minutes = params["minutes"].string();
