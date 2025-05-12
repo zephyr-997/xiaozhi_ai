@@ -19,9 +19,7 @@
 #define MQTT_PASSWORD  "azsxdcfv"                    // MQTT服务器密码
  
 // MQTT 主题 - 用于控制不同设备的主题
-#define LED_CMD_TOPIC  "HA-CMD-01/01/state"       // 客厅灯控制主题
-#define FAN_CMD_TOPIC  "home/livingroom/fan/command"       // 风扇开关控制主题
-#define FAN_PRESET_TOPIC "home/livingroom/fan/preset_mode" // 风扇速度控制主题
+#define MQTT_COMMAND_TOPIC    "HA-CMD-01/01/state"  // 统一命令主题
  
 // UART 配置 - 用于串口通信的设置
 #define UART_PORT UART_NUM_1 // 使用UART1端口
@@ -81,31 +79,53 @@ private:
                 command.erase(command.find_last_not_of("\r\n") + 1);
  
                 // 根据接收到的指令执行相应的操作
-                if (command.find("打开客厅灯") != std::string::npos) {
-                    // 识别到开灯指令，发送MQTT消息
-                    send_mqtt_command(LED_CMD_TOPIC, "ON");
-                } else if (command.find("关闭客厅灯") != std::string::npos) {
-                    // 识别到关灯指令，发送MQTT消息
-                    send_mqtt_command(LED_CMD_TOPIC, "OFF");
-                } else if (command.find("打开风扇") != std::string::npos) {
-                    // 识别到开风扇指令，发送MQTT消息
-                    send_mqtt_command(FAN_CMD_TOPIC, "ON");
-                } else if (command.find("关闭风扇") != std::string::npos) {
-                    // 识别到关风扇指令，发送MQTT消息
-                    send_mqtt_command(FAN_CMD_TOPIC, "OFF");
-                } else if (command.find("一挡") != std::string::npos) {
-                    // 识别到风扇一档指令，设置为低速
-                    send_mqtt_command(FAN_PRESET_TOPIC, "Low");
-                } else if (command.find("二挡") != std::string::npos) {
-                    // 识别到风扇二档指令，设置为中速
-                    send_mqtt_command(FAN_PRESET_TOPIC, "Medium");
-                } else if (command.find("三挡") != std::string::npos) {
-                    // 识别到风扇三档指令，设置为高速
-                    send_mqtt_command(FAN_PRESET_TOPIC, "High");
+                if (command.find("开始休息") != std::string::npos) {
+                    // 识别到开始休息指令，发送MQTT消息
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "REST_START");
+                    ESP_LOGI(TAG, "发送开始休息命令");
+                } else if (command.find("结束休息") != std::string::npos) {
+                    // 识别到结束休息指令，发送MQTT消息
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "REST_STOP");
+                    ESP_LOGI(TAG, "发送结束休息命令");
+                } else if (command.find("开始计时") != std::string::npos) {
+                    // 识别到开始计时指令，发送MQTT消息
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "TIMER_START");
+                    ESP_LOGI(TAG, "发送开始计时命令");
+                } else if (command.find("停止计时") != std::string::npos) {
+                    // 识别到停止计时指令，发送MQTT消息
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "TIMER_STOP");
+                    ESP_LOGI(TAG, "发送停止计时命令");
+                } else if (command.find("倒计时") != std::string::npos) {
+                    // 查找数字部分
+                    size_t pos = command.find("倒计时");
+                    if (pos != std::string::npos) {
+                        std::string timeStr = "";
+                        bool foundNumber = false;
+                        // 从"倒计时"后面查找数字
+                        for (size_t i = pos + 9; i < command.length(); i++) { // 9是"倒计时"的UTF-8长度
+                            if (isdigit(command[i])) {
+                                timeStr += command[i];
+                                foundNumber = true;
+                            } else if (foundNumber) {
+                                // 已找到数字并遇到非数字字符，结束查找
+                                break;
+                            }
+                        }
+                        
+                        if (!timeStr.empty()) {
+                            // 构造倒计时命令：COUNTDOWN:分钟数
+                            std::string countdownCmd = "COUNTDOWN:" + timeStr;
+                            send_mqtt_command(MQTT_COMMAND_TOPIC, countdownCmd.c_str());
+                            ESP_LOGI(TAG, "发送倒计时命令: %s分钟", timeStr.c_str());
+                        } else {
+                            ESP_LOGW(TAG, "无法识别倒计时时间");
+                        }
+                    }
                 }
-            }else {
+            } else {
                 // 未收到数据时短暂延时，减轻CPU负担
-                vTaskDelay(pdMS_TO_TICKS(10));}
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
     }
  
@@ -161,32 +181,42 @@ private:
             return false; // 此处简单返回false，实际应当反映真实状态
         });
  
-        // 注册控制方法 - 控制时钟开关
-        methods_.AddMethod("ControlClock", "控制时钟开关",
-            ParameterList(std::vector<Parameter>{Parameter("state", "开关状态", kValueTypeString)}),
+        // 注册控制方法 - 控制休息模式
+        methods_.AddMethod("ControlRestMode", "控制休息模式",
+            ParameterList(std::vector<Parameter>{Parameter("state", "状态(start/stop)", kValueTypeString)}),
             [this](const ParameterList& params) {
-                // 发送MQTT命令控制灯光
-                send_mqtt_command(LED_CMD_TOPIC, params["state"].string().c_str());
-            }
-        );
- 
-        // 注册控制方法 - 控制风扇开关
-        methods_.AddMethod("ControlFan", "控制风扇开关",
-            ParameterList(std::vector<Parameter>{Parameter("state", "开关状态", kValueTypeString)}),
-            [this](const ParameterList& params) {
-                // 发送MQTT命令控制风扇
+                // 发送MQTT命令控制休息模式
                 std::string state = params["state"].string();
-                send_mqtt_command(FAN_CMD_TOPIC, state.c_str());
+                if (state == "start" || state == "START") {
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "REST_START");
+                } else if (state == "stop" || state == "STOP") {
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "REST_STOP");
+                }
             }
         );
- 
-        // 注册控制方法 - 设置风扇速度
-        methods_.AddMethod("SetFanSpeed", "设置风扇档位",
-            ParameterList(std::vector<Parameter>{Parameter("speed", "档位（Low/Medium/High）", kValueTypeString)}),
+
+        // 注册控制方法 - 控制计时开关
+        methods_.AddMethod("ControlTimer", "控制计时开关",
+            ParameterList(std::vector<Parameter>{Parameter("state", "状态(start/stop)", kValueTypeString)}),
             [this](const ParameterList& params) {
-                // 发送MQTT命令设置风扇速度
-                std::string speed = params["speed"].string();
-                send_mqtt_command(FAN_PRESET_TOPIC, speed.c_str());
+                // 发送MQTT命令控制计时
+                std::string state = params["state"].string();
+                if (state == "start" || state == "START") {
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "TIMER_START");
+                } else if (state == "stop" || state == "STOP") {
+                    send_mqtt_command(MQTT_COMMAND_TOPIC, "TIMER_STOP");
+                }
+            }
+        );
+
+        // 注册控制方法 - 设置倒计时时间
+        methods_.AddMethod("SetCountdownTimer", "设置倒计时时间",
+            ParameterList(std::vector<Parameter>{Parameter("minutes", "倒计时分钟数", kValueTypeString)}),
+            [this](const ParameterList& params) {
+                // 发送MQTT命令设置倒计时时间
+                std::string minutes = params["minutes"].string();
+                std::string countdownCmd = "COUNTDOWN:" + minutes;
+                send_mqtt_command(MQTT_COMMAND_TOPIC, countdownCmd.c_str());
             }
         );
     }
